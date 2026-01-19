@@ -1,138 +1,199 @@
 ---
 name: convex-actions
-description: Best practices for Convex actions, transactions, and scheduling. Use when writing actions that call external APIs, using ctx.runQuery/ctx.runMutation, scheduling functions, or working with the Convex runtime vs Node.js runtime.
+description: Best practices for Convex actions, transactions, and scheduling. Use when writing actions that call external APIs, using ctx.runQuery/ctx.runMutation, scheduling functions with ctx.scheduler, or working with the Convex runtime vs Node.js runtime ("use node").
 ---
 
 # Convex Actions
 
+## Function Types Overview
+
+| Type | Database Access | External APIs | Caching | Use Case |
+|------|----------------|---------------|---------|----------|
+| Query | Read-only | No | Yes, reactive | Fetching data |
+| Mutation | Read/Write | No | No | Modifying data |
+| Action | Via runQuery/runMutation | Yes | No | External integrations |
+
+## Actions with Node.js Runtime
+
+Add `"use node";` at the top of files using Node.js APIs:
+
+```typescript
+// convex/email.ts
+"use node";
+
+import { action, internalAction } from "./_generated/server";
+import { v } from "convex/values";
+import { internal } from "./_generated/api";
+
+export const sendEmail = action({
+  args: { to: v.string(), subject: v.string(), body: v.string() },
+  returns: v.object({ success: v.boolean() }),
+  handler: async (ctx, args) => {
+    const apiKey = process.env.RESEND_API_KEY;
+    if (!apiKey) throw new Error("RESEND_API_KEY not configured");
+
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ from: "noreply@example.com", ...args }),
+    });
+
+    return { success: response.ok };
+  },
+});
+```
+
+## Scheduling Functions
+
+Use `ctx.scheduler.runAfter` to schedule functions:
+
+```typescript
+export const createTask = mutation({
+  args: { title: v.string(), userId: v.id("users") },
+  returns: v.id("tasks"),
+  handler: async (ctx, args) => {
+    const taskId = await ctx.db.insert("tasks", {
+      title: args.title,
+      userId: args.userId,
+      status: "pending",
+    });
+
+    // Schedule processing (always use internal functions!)
+    await ctx.scheduler.runAfter(0, internal.tasks.processTask, { taskId });
+
+    return taskId;
+  },
+});
+
+// Internal function for scheduled work
+export const processTask = internalMutation({
+  args: { taskId: v.id("tasks") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.patch("tasks", args.taskId, { status: "processing" });
+    // ... processing logic
+    return null;
+  },
+});
+```
+
 ## Use `runAction` Only When Changing Runtime
 
-`ctx.runAction` has overhead - it creates a separate function call while the parent action waits. Replace with plain TypeScript functions unless you need to call Node.js code from the Convex runtime.
+Replace `runAction` with plain TypeScript functions unless switching runtimes:
 
 ```typescript
-// Bad - unnecessary runAction
-export const scrapeWebsite = action({
-  args: { siteMapUrl: v.string() },
-  handler: async (ctx, { siteMapUrl }) => {
-    const siteMap = await fetch(siteMapUrl);
-    const pages = /* parse the site map */
-    await Promise.all(
-      pages.map((page) =>
-        ctx.runAction(internal.scrape.scrapeSinglePage, { url: page })
-      )
-    );
-  },
-});
+// Bad - unnecessary runAction overhead
+await ctx.runAction(internal.scrape.scrapePage, { url });
 
 // Good - plain TypeScript function
-// convex/model/scrape.ts
-export async function scrapeSinglePage(ctx: ActionCtx, { url }: { url: string }) {
-  const page = await fetch(url);
-  const text = /* parse the page */
-  await ctx.runMutation(internal.scrape.addPage, { url, text });
-}
-
-// convex/scrape.ts
-export const scrapeWebsite = action({
-  args: { siteMapUrl: v.string() },
-  handler: async (ctx, { siteMapUrl }) => {
-    const siteMap = await fetch(siteMapUrl);
-    const pages = /* parse the site map */
-    await Promise.all(
-      pages.map((page) => Scrape.scrapeSinglePage(ctx, { url: page }))
-    );
-  },
-});
+import * as Scrape from './model/scrape';
+await Scrape.scrapePage(ctx, { url });
 ```
 
-**How to find:** Search for `runAction` and check if parent and child use the same runtime.
+## Avoid Sequential `ctx.runMutation` / `ctx.runQuery`
 
-## Avoid Sequential `ctx.runMutation` / `ctx.runQuery` in Actions
+Each call runs in its own transaction. Combine for consistency:
 
-Each `ctx.runMutation` or `ctx.runQuery` runs in its own transaction. Sequential calls may be inconsistent with each other.
-
-**Problem: Inconsistent reads**
 ```typescript
-// Bad - team could change between queries
+// Bad - inconsistent reads
 const team = await ctx.runQuery(internal.teams.getTeam, { teamId });
-const teamOwner = await ctx.runQuery(internal.teams.getTeamOwner, { teamId });
-assert(team.owner === teamOwner._id); // Could fail!
+const owner = await ctx.runQuery(internal.teams.getOwner, { teamId });
 
-// Good - single query returns consistent data
-const teamAndOwner = await ctx.runQuery(internal.teams.getTeamAndOwner, { teamId });
-assert(teamAndOwner.team.owner === teamAndOwner.owner._id); // Always passes
-```
+// Good - single consistent query
+const { team, owner } = await ctx.runQuery(internal.teams.getTeamAndOwner, { teamId });
 
-**Problem: Loop without atomicity**
-```typescript
-// Bad - each insert is a separate transaction
-for (const member of teamMembers) {
-  await ctx.runMutation(internal.teams.insertUser, member);
+// Bad - non-atomic loop
+for (const user of users) {
+  await ctx.runMutation(internal.users.insert, user);
 }
 
-// Good - single mutation, atomic transaction
-await ctx.runMutation(internal.teams.insertUsers, { users: teamMembers });
+// Good - atomic batch
+await ctx.runMutation(internal.users.insertMany, { users });
 ```
 
-**Exceptions:**
-- Intentionally processing more data than fits in one transaction (migrations, aggregations)
-- Side effects between calls (read → call external API → write result)
+**Exceptions:** Migrations, aggregations, or when side effects occur between calls.
 
-## Use `ctx.runQuery` and `ctx.runMutation` Sparingly in Queries/Mutations
+## Prefer Helper Functions in Queries/Mutations
 
-Within queries and mutations, prefer plain TypeScript functions over `ctx.runQuery`/`ctx.runMutation`.
+Use plain TypeScript instead of `ctx.runQuery`/`ctx.runMutation`:
 
 ```typescript
-// Prefer this - plain helper function
+// Good - plain helper
 import * as Users from './model/users';
+const user = await Users.getCurrentUser(ctx);
 
-export const listMessages = query({
-  args: { conversationId: v.id("conversations") },
-  handler: async (ctx, { conversationId }) => {
-    const user = await Users.getCurrentUser(ctx);  // Plain function
-    // ...
-  },
-});
-
-// Instead of this - unnecessary overhead
-export const listMessages = query({
-  args: { conversationId: v.id("conversations") },
-  handler: async (ctx, { conversationId }) => {
-    const user = await ctx.runQuery(api.users.getCurrentUser);  // Extra overhead
-    // ...
-  },
-});
+// Bad - unnecessary overhead
+const user = await ctx.runQuery(api.users.getCurrentUser);
 ```
 
-**Exceptions:**
-- Components require `ctx.runQuery`/`ctx.runMutation`
-- Partial rollback on error needs `ctx.runMutation`:
-
+**Exception:** Partial rollback needs `ctx.runMutation`:
 ```typescript
-export const trySendMessage = mutation({
-  handler: async (ctx, { body, author }) => {
-    try {
-      await ctx.runMutation(internal.messages.sendMessage, { body, author });
-    } catch (e) {
-      // Record failure, rollback sendMessage writes
-      await ctx.db.insert("failures", { kind: "MessageFailed", body, author, error: `${e}` });
-    }
-  },
-});
+try {
+  await ctx.runMutation(internal.orders.process, { orderId });
+} catch (e) {
+  // Rollback process, record failure
+  await ctx.db.insert("failures", { orderId, error: `${e}` });
+}
 ```
 
 ## Await All Promises
 
-Always await promises from `ctx.scheduler.runAfter`, `ctx.db.patch`, etc. Unawaited promises may silently fail or cause unexpected behavior.
-
-**ESLint:** Use `no-floating-promises` rule from typescript-eslint.
+Always await async operations:
 
 ```typescript
 // Bad - missing await
 ctx.scheduler.runAfter(0, internal.tasks.process, { id });
-ctx.db.patch(docId, { status: "processing" });
+ctx.db.patch("tasks", docId, { status: "done" });
 
 // Good - awaited
 await ctx.scheduler.runAfter(0, internal.tasks.process, { id });
-await ctx.db.patch(docId, { status: "processing" });
+await ctx.db.patch("tasks", docId, { status: "done" });
 ```
+
+**ESLint:** Use `no-floating-promises` rule.
+
+## Complete Action Example
+
+```typescript
+// convex/payments.ts
+"use node";
+
+import { action, internalMutation } from "./_generated/server";
+import { v } from "convex/values";
+import { internal } from "./_generated/api";
+
+export const processPayment = action({
+  args: { orderId: v.id("orders"), amount: v.number() },
+  returns: v.object({ success: v.boolean(), transactionId: v.optional(v.string()) }),
+  handler: async (ctx, args) => {
+    // 1. Read data via query
+    const order = await ctx.runQuery(internal.orders.get, { orderId: args.orderId });
+    if (!order) throw new Error("Order not found");
+
+    // 2. Call external API
+    const result = await fetch("https://api.stripe.com/v1/charges", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.STRIPE_KEY}` },
+      body: new URLSearchParams({ amount: String(args.amount * 100), currency: "usd" }),
+    });
+    const data = await result.json();
+
+    // 3. Update database via mutation
+    await ctx.runMutation(internal.orders.updateStatus, {
+      orderId: args.orderId,
+      status: data.status === "succeeded" ? "paid" : "failed",
+      transactionId: data.id,
+    });
+
+    return { success: data.status === "succeeded", transactionId: data.id };
+  },
+});
+```
+
+## References
+
+- Actions: https://docs.convex.dev/functions/actions
+- Scheduling: https://docs.convex.dev/scheduling/scheduled-functions

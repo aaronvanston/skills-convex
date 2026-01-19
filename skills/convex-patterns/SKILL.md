@@ -1,175 +1,185 @@
 ---
 name: convex-patterns
-description: Code organization patterns and TypeScript best practices for Convex. Use when structuring a Convex project, writing helper functions, working with types like QueryCtx/MutationCtx/ActionCtx, or organizing code in a convex/model directory.
+description: Code organization patterns and TypeScript best practices for Convex. Use when structuring a Convex project, writing helper functions, defining schemas, working with types like QueryCtx/MutationCtx/ActionCtx, or organizing code in a convex/model directory.
 ---
 
 # Convex Patterns
 
-## Use Helper Functions for Shared Code
+## Always Define Return Validators
 
-Most logic should be plain TypeScript functions. The `query`, `mutation`, and `action` wrappers should be thin wrappers calling helper functions.
+Every function should have a `returns` validator:
 
-**Recommended structure:**
+```typescript
+export const getUser = query({
+  args: { userId: v.id("users") },
+  returns: v.union(
+    v.object({
+      _id: v.id("users"),
+      _creationTime: v.number(),
+      name: v.string(),
+      email: v.string(),
+    }),
+    v.null()
+  ),
+  handler: async (ctx, args) => {
+    return await ctx.db.get("users", args.userId);
+  },
+});
+```
+
+## Project Structure
+
 ```
 convex/
 ├── _generated/
-├── model/           # Business logic lives here
+├── lib/              # Shared utilities
+│   └── auth.ts       # Auth helpers
+├── model/            # Business logic
 │   ├── users.ts
-│   ├── conversations.ts
-│   └── teams.ts
-├── conversations.ts # Thin wrappers defining public API
-├── users.ts
-└── schema.ts
+│   └── tasks.ts
+├── schema.ts         # Database schema
+├── users.ts          # Public API (thin wrappers)
+└── tasks.ts
 ```
 
-**Example helper functions:**
+## Helper Functions Pattern
+
+Business logic in `model/`, thin wrappers in public API:
+
 ```typescript
 // convex/model/users.ts
-import { QueryCtx } from '../_generated/server';
-
-export async function getCurrentUser(ctx: QueryCtx) {
-  const userIdentity = await ctx.auth.getUserIdentity();
-  if (userIdentity === null) throw new Error("Unauthorized");
-
-  const user = /* query ctx.db to load the user */
-  const userSettings = /* load related documents */
-  return { user, settings: userSettings };
-}
-```
-
-```typescript
-// convex/model/conversations.ts
 import { QueryCtx, MutationCtx } from '../_generated/server';
-import { Id, Doc } from '../_generated/dataModel';
-import * as Users from './users';
+import { Doc, Id } from '../_generated/dataModel';
+import { ConvexError } from "convex/values";
 
-export async function ensureHasAccess(
-  ctx: QueryCtx,
-  { conversationId }: { conversationId: Id<"conversations"> }
-) {
-  const user = await Users.getCurrentUser(ctx);
-  const conversation = await ctx.db.get("conversations", conversationId);
-  if (conversation === null || !conversation.members.includes(user._id)) {
-    throw new Error("Unauthorized");
+export async function getCurrentUser(ctx: QueryCtx | MutationCtx): Promise<Doc<"users">> {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) {
+    throw new ConvexError({ code: "UNAUTHENTICATED", message: "Not logged in" });
   }
-  return conversation;
+
+  const user = await ctx.db
+    .query("users")
+    .withIndex("by_tokenIdentifier", (q) => q.eq("tokenIdentifier", identity.tokenIdentifier))
+    .unique();
+
+  if (!user) {
+    throw new ConvexError({ code: "NOT_FOUND", message: "User not found" });
+  }
+  return user;
 }
 
-export async function listMessages(
-  ctx: QueryCtx,
-  { conversationId }: { conversationId: Id<"conversations"> }
-) {
-  await ensureHasAccess(ctx, { conversationId });
-  const messages = /* query ctx.db */
-  return messages;
+export async function getById(ctx: QueryCtx, userId: Id<"users">): Promise<Doc<"users"> | null> {
+  return await ctx.db.get("users", userId);
 }
 ```
 
-**Thin public API:**
 ```typescript
-// convex/conversations.ts
-import * as Conversations from './model/conversations';
+// convex/users.ts (thin wrapper)
+import { query } from "./_generated/server";
+import { v } from "convex/values";
+import * as Users from "./model/users";
 
-export const listMessages = internalQuery({
-  args: { conversationId: v.id("conversations") },
-  handler: async (ctx, { conversationId }) => {
-    return Conversations.listMessages(ctx, { conversationId });
-  },
+export const get = query({
+  args: { userId: v.id("users") },
+  returns: v.union(v.object({ _id: v.id("users"), name: v.string() }), v.null()),
+  handler: async (ctx, args) => Users.getById(ctx, args.userId),
+});
+```
+
+## Schema Definition
+
+```typescript
+// convex/schema.ts
+import { defineSchema, defineTable } from "convex/server";
+import { v } from "convex/values";
+
+export default defineSchema({
+  users: defineTable({
+    tokenIdentifier: v.string(),
+    name: v.string(),
+    email: v.string(),
+    role: v.union(v.literal("user"), v.literal("admin")),
+  })
+    .index("by_tokenIdentifier", ["tokenIdentifier"])
+    .index("by_email", ["email"]),
+
+  tasks: defineTable({
+    title: v.string(),
+    description: v.optional(v.string()),
+    userId: v.id("users"),
+    status: v.union(v.literal("pending"), v.literal("done")),
+    priority: v.union(v.literal("low"), v.literal("medium"), v.literal("high")),
+  })
+    .index("by_user", ["userId"])
+    .index("by_user_and_status", ["userId", "status"]),
 });
 ```
 
 ## TypeScript Types
 
-### Context Types
-
 ```typescript
-import { QueryCtx, MutationCtx, ActionCtx, DatabaseReader, DatabaseWriter } from "./_generated/server";
-import { Auth, StorageReader, StorageWriter, StorageActionWriter } from "convex/server";
+// Context types
+import { QueryCtx, MutationCtx, ActionCtx } from "./_generated/server";
 
-// MutationCtx also satisfies QueryCtx interface
-export function myReadHelper(ctx: QueryCtx, id: Id<"channels">) { /* ... */ }
-export function myActionHelper(ctx: ActionCtx, doc: Doc<"messages">) { /* ... */ }
-```
-
-### Document and ID Types
-
-```typescript
+// Document and ID types
 import { Doc, Id } from "./_generated/dataModel";
+type User = Doc<"users">;
+type UserId = Id<"users">;
 
-function Channel(props: { channelId: Id<"channels"> }) { /* ... */ }
-function MessagesView(props: { message: Doc<"messages"> }) { /* ... */ }
-```
-
-### Infer Types from Validators
-
-```typescript
+// Infer types from validators
 import { Infer, v } from "convex/values";
+const priorityValidator = v.union(v.literal("low"), v.literal("medium"), v.literal("high"));
+type Priority = Infer<typeof priorityValidator>;  // "low" | "medium" | "high"
 
-export const courseValidator = v.union(
-  v.literal("appetizer"),
-  v.literal("main"),
-  v.literal("dessert")
-);
-
-export type Course = Infer<typeof courseValidator>;
-// Inferred as 'appetizer' | 'main' | 'dessert'
-```
-
-### Document Types Without System Fields
-
-```typescript
+// Without system fields (for inserts)
 import { WithoutSystemFields } from "convex/server";
-import { Doc } from "./_generated/dataModel";
+type NewUser = WithoutSystemFields<Doc<"users">>;
 
-export async function insertMessageHelper(
-  ctx: MutationCtx,
-  values: WithoutSystemFields<Doc<"messages">>
-) {
-  await ctx.db.insert("messages", values);
-}
-```
-
-### Function Return Types (Client-side)
-
-```typescript
+// Client-side return types
 import { FunctionReturnType } from "convex/server";
-import { UsePaginatedQueryReturnType } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function MyHelper(props: {
-  data: FunctionReturnType<typeof api.myFunctions.getSomething>;
-}) { /* ... */ }
-
-function MyPaginatedHelper(props: {
-  paginatedData: UsePaginatedQueryReturnType<typeof api.myFunctions.getSomethingPaginated>;
-}) { /* ... */ }
+type UserData = FunctionReturnType<typeof api.users.get>;
 ```
 
-## Argument Validation for Type Inference
+## Validator Types Reference
 
-With argument validators, Convex infers argument types automatically:
+| Validator | TypeScript | Example |
+|-----------|-----------|---------|
+| `v.string()` | `string` | `"hello"` |
+| `v.number()` | `number` | `42` |
+| `v.boolean()` | `boolean` | `true` |
+| `v.null()` | `null` | `null` |
+| `v.id("table")` | `Id<"table">` | Document reference |
+| `v.array(v)` | `T[]` | `[1, 2, 3]` |
+| `v.object({})` | `{ ... }` | `{ name: "..." }` |
+| `v.optional(v)` | `T \| undefined` | Optional field |
+| `v.union(...)` | `T1 \| T2` | Multiple types |
+| `v.literal(x)` | `"x"` | Exact value |
+
+## Reusable Validators
 
 ```typescript
-export default mutation({
-  args: {
-    body: v.string(),
-    author: v.string(),
-  },
-  // Convex knows args type is { body: string, author: string }
-  handler: async (ctx, args) => {
-    const { body, author } = args;
-    await ctx.db.insert("messages", { body, author });
-  },
+// convex/validators.ts
+import { v } from "convex/values";
+
+export const userValidator = v.object({
+  _id: v.id("users"),
+  _creationTime: v.number(),
+  name: v.string(),
+  email: v.string(),
+  role: v.union(v.literal("user"), v.literal("admin")),
+});
+
+export const taskValidator = v.object({
+  _id: v.id("tasks"),
+  _creationTime: v.number(),
+  title: v.string(),
+  userId: v.id("users"),
+  status: v.union(v.literal("pending"), v.literal("done")),
 });
 ```
 
-For internal functions with complex types, annotate manually:
+## References
 
-```typescript
-export default internalMutation({
-  handler: async (ctx, args: { body: string; author: string }) => {
-    const { body, author } = args;
-    await ctx.db.insert("messages", { body, author });
-  },
-});
-```
+- TypeScript: https://docs.convex.dev/understanding/best-practices/typescript
+- Schemas: https://docs.convex.dev/database/schemas
