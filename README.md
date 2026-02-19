@@ -1,3 +1,14 @@
+> ⚠️ **This repo has been consolidated into [aaronvanston/agent-skills](https://github.com/aaronvanston/agent-skills).**
+>
+> Install the new version:
+> ```bash
+> npx skills add aaronvanston/agent-skills
+> ```
+>
+> This repo is kept for backwards compatibility but will not be updated.
+
+---
+
 # Skills Convex
 
 AI agent skills for [Convex](https://convex.dev) development best practices.
